@@ -462,3 +462,103 @@
         (ok false)
     )
 )
+
+(define-map reputation-tiers
+    (string-ascii 10)
+    {
+        min-score: uint,
+        multiplier: uint,
+    }
+)
+
+(define-public (initialize-reputation-tiers)
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-set reputation-tiers "bronze" {
+            min-score: u0,
+            multiplier: u100,
+        })
+        (map-set reputation-tiers "silver" {
+            min-score: u50,
+            multiplier: u125,
+        })
+        (map-set reputation-tiers "gold" {
+            min-score: u150,
+            multiplier: u150,
+        })
+        (map-set reputation-tiers "platinum" {
+            min-score: u300,
+            multiplier: u200,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-reputation-multiplier (reporter principal))
+    (let ((stats (default-to {
+            total-reports: u0,
+            total-earned: u0,
+            reputation-score: u0,
+        }
+            (map-get? reporter-stats reporter)
+        )))
+        (let ((score (get reputation-score stats)))
+            (if (>= score u300)
+                u200
+                (if (>= score u150)
+                    u150
+                    (if (>= score u50)
+                        u125
+                        u100
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (calculate-reputation-bonus
+        (base-amount uint)
+        (reporter principal)
+    )
+    (let ((multiplier (get-reputation-multiplier reporter)))
+        (/ (* base-amount multiplier) u100)
+    )
+)
+
+(define-read-only (get-reporter-tier (reporter principal))
+    (let ((stats (default-to {
+            total-reports: u0,
+            total-earned: u0,
+            reputation-score: u0,
+        }
+            (map-get? reporter-stats reporter)
+        )))
+        (let ((score (get reputation-score stats)))
+            (if (>= score u300)
+                "platinum"
+                (if (>= score u150)
+                    "gold"
+                    (if (>= score u50)
+                        "silver"
+                        "bronze"
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-leaderboard-entry (reporter principal))
+    (match (map-get? reporter-stats reporter)
+        stats (ok {
+            reporter: reporter,
+            total-reports: (get total-reports stats),
+            total-earned: (get total-earned stats),
+            reputation-score: (get reputation-score stats),
+            tier: (get-reporter-tier reporter),
+            multiplier: (get-reputation-multiplier reporter),
+        })
+        ERR-NOT-AUTHORIZED
+    )
+)
