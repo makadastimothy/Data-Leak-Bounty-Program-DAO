@@ -12,6 +12,11 @@
 (define-constant ERR-PAYOUT-TOO-EARLY (err u111))
 (define-constant ERR-PAYOUT-EXPIRED (err u112))
 (define-constant ERR-INVALID-TIER (err u113))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u114))
+(define-constant ERR-DISPUTE-EXPIRED (err u115))
+(define-constant ERR-DISPUTE-RESOLVED (err u116))
+(define-constant ERR-MEDIATOR-NOT-FOUND (err u117))
+(define-constant ERR-INVALID-DISPUTE-STATUS (err u118))
 
 (define-data-var dao-owner principal tx-sender)
 (define-data-var min-bounty-amount uint u1000)
@@ -560,5 +565,268 @@
             multiplier: (get-reputation-multiplier reporter),
         })
         ERR-NOT-AUTHORIZED
+    )
+)
+
+(define-data-var dispute-counter uint u0)
+(define-data-var dispute-period uint u2880)
+(define-data-var mediator-fee uint u50)
+
+(define-map disputes
+    uint
+    {
+        bounty-id: uint,
+        reporter: principal,
+        reason: (string-ascii 256),
+        status: (string-ascii 20),
+        mediator: (optional principal),
+        created-at: uint,
+        resolved-at: uint,
+        resolution: (string-ascii 256),
+    }
+)
+
+(define-map mediators
+    principal
+    {
+        total-resolved: uint,
+        reputation-score: uint,
+        is-active: bool,
+    }
+)
+
+(define-map dispute-evidence
+    {
+        dispute-id: uint,
+        submitter: principal,
+    }
+    {
+        evidence: (string-ascii 500),
+        timestamp: uint,
+    }
+)
+
+(define-public (become-mediator)
+    (begin
+        (map-set mediators tx-sender {
+            total-resolved: u0,
+            reputation-score: u100,
+            is-active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-mediator (mediator-principal principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (match (map-get? mediators mediator-principal)
+            mediator-stats (map-set mediators mediator-principal
+                (merge mediator-stats { is-active: false })
+            )
+            false
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-dispute
+        (bounty-id uint)
+        (reason (string-ascii 256))
+    )
+    (let (
+            (bounty (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
+            (dispute-id (+ (var-get dispute-counter) u1))
+        )
+        (asserts! (is-eq tx-sender (get reporter bounty)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status bounty) "rejected") ERR-INVALID-STATUS)
+        (map-set disputes dispute-id {
+            bounty-id: bounty-id,
+            reporter: tx-sender,
+            reason: reason,
+            status: "pending",
+            mediator: none,
+            created-at: stacks-block-height,
+            resolved-at: u0,
+            resolution: "",
+        })
+        (var-set dispute-counter dispute-id)
+        (ok dispute-id)
+    )
+)
+
+(define-public (assign-mediator
+        (dispute-id uint)
+        (mediator-principal principal)
+    )
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status dispute) "pending")
+            ERR-INVALID-DISPUTE-STATUS
+        )
+        (match (map-get? mediators mediator-principal)
+            mediator-stats (begin
+                (asserts! (get is-active mediator-stats) ERR-MEDIATOR-NOT-FOUND)
+                (map-set disputes dispute-id
+                    (merge dispute {
+                        mediator: (some mediator-principal),
+                        status: "under-review",
+                    })
+                )
+                (ok true)
+            )
+            ERR-MEDIATOR-NOT-FOUND
+        )
+    )
+)
+
+(define-public (submit-evidence
+        (dispute-id uint)
+        (evidence (string-ascii 500))
+    )
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get reporter dispute))
+                (is-eq tx-sender (var-get dao-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-eq (get status dispute) "under-review")
+            ERR-INVALID-DISPUTE-STATUS
+        )
+        (map-set dispute-evidence {
+            dispute-id: dispute-id,
+            submitter: tx-sender,
+        } {
+            evidence: evidence,
+            timestamp: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (resolution (string-ascii 256))
+        (approved bool)
+        (award-amount uint)
+    )
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND)))
+        (asserts!
+            (match (get mediator dispute)
+                mediator (is-eq tx-sender mediator)
+                false
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-eq (get status dispute) "under-review")
+            ERR-INVALID-DISPUTE-STATUS
+        )
+        (asserts!
+            (< stacks-block-height
+                (+ (get created-at dispute) (var-get dispute-period))
+            )
+            ERR-DISPUTE-EXPIRED
+        )
+        (map-set disputes dispute-id
+            (merge dispute {
+                status: (if approved
+                    "approved"
+                    "rejected"
+                ),
+                resolved-at: stacks-block-height,
+                resolution: resolution,
+            })
+        )
+        (begin
+            (if approved
+                (let ((bounty (unwrap! (map-get? bounties (get bounty-id dispute))
+                        ERR-BOUNTY-NOT-FOUND
+                    )))
+                    (map-set bounties (get bounty-id dispute)
+                        (merge bounty {
+                            status: "approved",
+                            amount: award-amount,
+                            claimed-at: stacks-block-height,
+                        })
+                    )
+                    (try! (as-contract (stx-transfer? award-amount tx-sender (get reporter dispute))))
+                    (var-set treasury-balance
+                        (- (var-get treasury-balance) award-amount)
+                    )
+                    (match (map-get? reporter-stats (get reporter dispute))
+                        prev-stats (map-set reporter-stats (get reporter dispute) {
+                            total-reports: (get total-reports prev-stats),
+                            total-earned: (+ (get total-earned prev-stats) award-amount),
+                            reputation-score: (+ (get reputation-score prev-stats) u5),
+                        })
+                        (map-set reporter-stats (get reporter dispute) {
+                            total-reports: u1,
+                            total-earned: award-amount,
+                            reputation-score: u5,
+                        })
+                    )
+                )
+                true
+            )
+            (match (get mediator dispute)
+                mediator (match (map-get? mediators mediator)
+                    mediator-stats (begin
+                        (try! (as-contract (stx-transfer? (var-get mediator-fee) tx-sender mediator)))
+                        (map-set mediators mediator
+                            (merge mediator-stats {
+                                total-resolved: (+ (get total-resolved mediator-stats) u1),
+                                reputation-score: (+ (get reputation-score mediator-stats) u10),
+                            })
+                        )
+                    )
+                    true
+                )
+                true
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (set-dispute-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set dispute-period new-period)
+        (ok true)
+    )
+)
+
+(define-public (set-mediator-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set mediator-fee new-fee)
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (ok (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+)
+
+(define-read-only (get-mediator-stats (mediator-principal principal))
+    (ok (unwrap! (map-get? mediators mediator-principal) ERR-MEDIATOR-NOT-FOUND))
+)
+
+(define-read-only (get-dispute-evidence
+        (dispute-id uint)
+        (submitter principal)
+    )
+    (ok (map-get? dispute-evidence {
+        dispute-id: dispute-id,
+        submitter: submitter,
+    }))
+)
+
+(define-read-only (can-dispute (bounty-id uint))
+    (match (map-get? bounties bounty-id)
+        bounty (ok (is-eq (get status bounty) "rejected"))
+        (ok false)
     )
 )
