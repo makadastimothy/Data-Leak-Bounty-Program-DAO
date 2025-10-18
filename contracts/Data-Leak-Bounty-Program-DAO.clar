@@ -17,6 +17,10 @@
 (define-constant ERR-DISPUTE-RESOLVED (err u116))
 (define-constant ERR-MEDIATOR-NOT-FOUND (err u117))
 (define-constant ERR-INVALID-DISPUTE-STATUS (err u118))
+(define-constant ERR-STAKE-NOT-FOUND (err u119))
+(define-constant ERR-STAKE-ALREADY-EXISTS (err u120))
+(define-constant ERR-INSUFFICIENT-STAKE (err u121))
+(define-constant ERR-STAKE-LOCKED (err u122))
 
 (define-data-var dao-owner principal tx-sender)
 (define-data-var min-bounty-amount uint u1000)
@@ -827,6 +831,277 @@
 (define-read-only (can-dispute (bounty-id uint))
     (match (map-get? bounties bounty-id)
         bounty (ok (is-eq (get status bounty) "rejected"))
+        (ok false)
+    )
+)
+
+(define-data-var min-stake-amount uint u500)
+(define-data-var stake-bonus-multiplier uint u150)
+(define-data-var slash-percentage uint u50)
+(define-data-var total-stakes uint u0)
+
+(define-map reporter-stakes
+    principal
+    {
+        staked-amount: uint,
+        active-reports: uint,
+        total-slashed: uint,
+        locked-until: uint,
+    }
+)
+
+(define-map bounty-stakes
+    uint
+    {
+        reporter: principal,
+        stake-amount: uint,
+        is-released: bool,
+    }
+)
+
+(define-public (create-stake (stake-amount uint))
+    (begin
+        (asserts! (>= stake-amount (var-get min-stake-amount))
+            ERR-INSUFFICIENT-STAKE
+        )
+        (asserts! (is-none (map-get? reporter-stakes tx-sender))
+            ERR-STAKE-ALREADY-EXISTS
+        )
+        (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+        (map-set reporter-stakes tx-sender {
+            staked-amount: stake-amount,
+            active-reports: u0,
+            total-slashed: u0,
+            locked-until: u0,
+        })
+        (var-set total-stakes (+ (var-get total-stakes) stake-amount))
+        (ok true)
+    )
+)
+
+(define-public (increase-stake (additional-amount uint))
+    (let ((stake (unwrap! (map-get? reporter-stakes tx-sender) ERR-STAKE-NOT-FOUND)))
+        (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
+        (map-set reporter-stakes tx-sender
+            (merge stake { staked-amount: (+ (get staked-amount stake) additional-amount) })
+        )
+        (var-set total-stakes (+ (var-get total-stakes) additional-amount))
+        (ok true)
+    )
+)
+
+(define-public (submit-report-with-stake
+        (description (string-ascii 256))
+        (stake-commitment uint)
+    )
+    (let (
+            (stake (unwrap! (map-get? reporter-stakes tx-sender) ERR-STAKE-NOT-FOUND))
+            (bounty-id (+ (var-get total-bounties) u1))
+        )
+        (asserts! (>= (get staked-amount stake) stake-commitment)
+            ERR-INSUFFICIENT-STAKE
+        )
+        (asserts! (>= stake-commitment (var-get min-stake-amount))
+            ERR-INSUFFICIENT-STAKE
+        )
+        (asserts! (>= stacks-block-height (get locked-until stake))
+            ERR-STAKE-LOCKED
+        )
+        (map-set bounty-stakes bounty-id {
+            reporter: tx-sender,
+            stake-amount: stake-commitment,
+            is-released: false,
+        })
+        (map-set reporter-stakes tx-sender
+            (merge stake {
+                active-reports: (+ (get active-reports stake) u1),
+                staked-amount: (- (get staked-amount stake) stake-commitment),
+            })
+        )
+        (map-set bounties bounty-id {
+            reporter: tx-sender,
+            amount: u0,
+            description: description,
+            status: "pending",
+            created-at: stacks-block-height,
+            claimed-at: u0,
+        })
+        (match (map-get? reporter-stats tx-sender)
+            prev-stats (map-set reporter-stats tx-sender {
+                total-reports: (+ (get total-reports prev-stats) u1),
+                total-earned: (get total-earned prev-stats),
+                reputation-score: (get reputation-score prev-stats),
+            })
+            (map-set reporter-stats tx-sender {
+                total-reports: u1,
+                total-earned: u0,
+                reputation-score: u1,
+            })
+        )
+        (var-set total-bounties bounty-id)
+        (ok bounty-id)
+    )
+)
+
+(define-public (release-stake-on-approval
+        (bounty-id uint)
+        (reward-amount uint)
+    )
+    (let (
+            (bounty (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
+            (bounty-stake (unwrap! (map-get? bounty-stakes bounty-id) ERR-STAKE-NOT-FOUND))
+            (reporter (get reporter bounty-stake))
+            (stake-amount (get stake-amount bounty-stake))
+            (bonus-amount (/ (* stake-amount (var-get stake-bonus-multiplier)) u100))
+            (total-return (+ stake-amount bonus-amount))
+        )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status bounty) "pending") ERR-INVALID-STATUS)
+        (asserts! (not (get is-released bounty-stake)) ERR-ALREADY-CLAIMED)
+        (asserts! (<= reward-amount (var-get treasury-balance))
+            ERR-INSUFFICIENT-BALANCE
+        )
+        (map-set bounties bounty-id
+            (merge bounty {
+                amount: reward-amount,
+                status: "approved",
+                claimed-at: stacks-block-height,
+            })
+        )
+        (map-set bounty-stakes bounty-id
+            (merge bounty-stake { is-released: true })
+        )
+        (match (map-get? reporter-stakes reporter)
+            stake (map-set reporter-stakes reporter
+                (merge stake {
+                    staked-amount: (+ (get staked-amount stake) total-return),
+                    active-reports: (- (get active-reports stake) u1),
+                })
+            )
+            false
+        )
+        (try! (as-contract (stx-transfer? reward-amount tx-sender reporter)))
+        (var-set treasury-balance (- (var-get treasury-balance) reward-amount))
+        (match (map-get? reporter-stats reporter)
+            prev-stats (map-set reporter-stats reporter {
+                total-reports: (get total-reports prev-stats),
+                total-earned: (+ (get total-earned prev-stats) reward-amount),
+                reputation-score: (+ (get reputation-score prev-stats) u15),
+            })
+            (map-set reporter-stats reporter {
+                total-reports: u1,
+                total-earned: reward-amount,
+                reputation-score: u15,
+            })
+        )
+        (ok total-return)
+    )
+)
+
+(define-public (slash-stake-on-rejection (bounty-id uint))
+    (let (
+            (bounty (unwrap! (map-get? bounties bounty-id) ERR-BOUNTY-NOT-FOUND))
+            (bounty-stake (unwrap! (map-get? bounty-stakes bounty-id) ERR-STAKE-NOT-FOUND))
+            (reporter (get reporter bounty-stake))
+            (stake-amount (get stake-amount bounty-stake))
+            (slash-amount (/ (* stake-amount (var-get slash-percentage)) u100))
+            (return-amount (- stake-amount slash-amount))
+        )
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status bounty) "pending") ERR-INVALID-STATUS)
+        (asserts! (not (get is-released bounty-stake)) ERR-ALREADY-CLAIMED)
+        (map-set bounties bounty-id (merge bounty { status: "rejected" }))
+        (map-set bounty-stakes bounty-id
+            (merge bounty-stake { is-released: true })
+        )
+        (var-set treasury-balance (+ (var-get treasury-balance) slash-amount))
+        (var-set total-stakes (- (var-get total-stakes) slash-amount))
+        (match (map-get? reporter-stakes reporter)
+            stake (map-set reporter-stakes reporter
+                (merge stake {
+                    staked-amount: (+ (get staked-amount stake) return-amount),
+                    active-reports: (- (get active-reports stake) u1),
+                    total-slashed: (+ (get total-slashed stake) slash-amount),
+                    locked-until: (+ stacks-block-height u720),
+                })
+            )
+            false
+        )
+        (ok slash-amount)
+    )
+)
+
+(define-public (withdraw-stake)
+    (let ((stake (unwrap! (map-get? reporter-stakes tx-sender) ERR-STAKE-NOT-FOUND)))
+        (asserts! (is-eq (get active-reports stake) u0) ERR-STAKE-LOCKED)
+        (asserts! (>= stacks-block-height (get locked-until stake))
+            ERR-STAKE-LOCKED
+        )
+        (asserts! (> (get staked-amount stake) u0) ERR-INSUFFICIENT-STAKE)
+        (try! (as-contract (stx-transfer? (get staked-amount stake) tx-sender tx-sender)))
+        (var-set total-stakes
+            (- (var-get total-stakes) (get staked-amount stake))
+        )
+        (map-delete reporter-stakes tx-sender)
+        (ok (get staked-amount stake))
+    )
+)
+
+(define-public (set-min-stake-amount (new-amount uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set min-stake-amount new-amount)
+        (ok true)
+    )
+)
+
+(define-public (set-stake-bonus-multiplier (new-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (var-set stake-bonus-multiplier new-multiplier)
+        (ok true)
+    )
+)
+
+(define-public (set-slash-percentage (new-percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= new-percentage u100) ERR-INVALID-AMOUNT)
+        (var-set slash-percentage new-percentage)
+        (ok true)
+    )
+)
+
+(define-read-only (get-reporter-stake (reporter principal))
+    (ok (unwrap! (map-get? reporter-stakes reporter) ERR-STAKE-NOT-FOUND))
+)
+
+(define-read-only (get-bounty-stake (bounty-id uint))
+    (ok (unwrap! (map-get? bounty-stakes bounty-id) ERR-STAKE-NOT-FOUND))
+)
+
+(define-read-only (calculate-stake-return
+        (stake-amount uint)
+        (is-approved bool)
+    )
+    (if is-approved
+        (ok (+ stake-amount
+            (/ (* stake-amount (var-get stake-bonus-multiplier)) u100)
+        ))
+        (ok (- stake-amount (/ (* stake-amount (var-get slash-percentage)) u100)))
+    )
+)
+
+(define-read-only (get-total-stakes)
+    (ok (var-get total-stakes))
+)
+
+(define-read-only (can-submit-staked-report (reporter principal))
+    (match (map-get? reporter-stakes reporter)
+        stake (ok (and
+            (>= (get staked-amount stake) (var-get min-stake-amount))
+            (>= stacks-block-height (get locked-until stake))
+        ))
         (ok false)
     )
 )
