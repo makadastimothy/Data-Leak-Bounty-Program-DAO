@@ -1105,3 +1105,25 @@
         (ok false)
     )
 )
+
+(define-read-only (get-dao-metrics)
+    (ok {
+        dao-owner: (var-get dao-owner),
+        min-bounty-amount: (var-get min-bounty-amount),
+        total-bounties: (var-get total-bounties),
+        treasury-balance: (var-get treasury-balance),
+        proposal-counter: (var-get proposal-counter),
+        voting-threshold: (var-get voting-threshold),
+        proposal-duration: (var-get proposal-duration),
+        auto-payout-delay: (var-get auto-payout-delay),
+        escalation-period: (var-get escalation-period),
+        max-auto-payout: (var-get max-auto-payout),
+        dispute-counter: (var-get dispute-counter),
+        dispute-period: (var-get dispute-period),
+        mediator-fee: (var-get mediator-fee),
+        min-stake-amount: (var-get min-stake-amount),
+        stake-bonus-multiplier: (var-get stake-bonus-multiplier),
+        slash-percentage: (var-get slash-percentage),
+        total-stakes: (var-get total-stakes),
+    })
+)
